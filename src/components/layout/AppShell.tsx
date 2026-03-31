@@ -10,7 +10,7 @@ import WorkspaceGuide from './WorkspaceGuide';
 import { useAppPlanStore } from '../../store/useAppPlanStore';
 
 const AppShell: React.FC = () => {
-  const { isLoaded, isReloading, workspacePath, reloadWorkspace, previewLayout } = useAppPlanStore();
+  const { isLoaded, isReloading, openProjectPaths, reloadWorkspace, previewLayout } = useAppPlanStore();
 
   useEffect(() => {
     reloadWorkspace();
@@ -27,7 +27,7 @@ const AppShell: React.FC = () => {
     );
   }
 
-  if (!workspacePath) {
+  if (openProjectPaths.length === 0) {
     return (
       <ThemeProvider theme={darkTheme}>
         <CssBaseline />

@@ -6,9 +6,7 @@ import { parseMarkdownDiagram, generateMarkdownDiagram } from '../utils/markdown
 import { GitProjectStatus } from '../types/git';
 import { getProjectGitStatus } from '../utils/git/parseGitStatus';
 
-// Tauri API for joining paths if needed, but we can do simple string concat
-// import { join } from '@tauri-apps/api/path';
-
+import { join } from '@tauri-apps/api/path';
 interface AppPlanState {
   apps: AppItem[];
   diagrams: DiagramItem[];
@@ -52,9 +50,7 @@ interface AppPlanState {
   togglePreviewLayout: () => void;
 }
 
-// Basic path joiner utility
-const joinPath = (...parts: string[]) => parts.join('/').replace(/\/+/g, '/');
-
+// Remove synchronous joinPath
 const savedRecent = localStorage.getItem('appplan_recent_projects');
 const initialRecent = savedRecent ? JSON.parse(savedRecent) : [];
 
@@ -64,16 +60,26 @@ let initialOpenPaths: string[] = savedPaths ? JSON.parse(savedPaths) : [];
 const legacyWorkspace = localStorage.getItem('appplan_workspace');
 if (initialOpenPaths.length === 0 && legacyWorkspace) {
   initialOpenPaths = [legacyWorkspace];
+  // Auto-import to recent if not there
+  if (!initialRecent.find((r: any) => r.rootPath === legacyWorkspace)) {
+    const pathParts = legacyWorkspace.split(/[\\/]/);
+    const appName = pathParts[pathParts.length - 1] || 'AppProject';
+    initialRecent.unshift({ name: appName, rootPath: legacyWorkspace });
+    localStorage.setItem('appplan_recent_projects', JSON.stringify(initialRecent));
+  }
+}
+
+// If we have recent projects but no open paths, automatically restore the last recent project to match dev/prod behavior
+if (initialOpenPaths.length === 0 && initialRecent.length > 0) {
+  initialOpenPaths = [initialRecent[0].rootPath];
 }
 
 async function scanProject(appPath: string): Promise<{ app: AppItem | null; diagrams: DiagramItem[] }> {
   const pathParts = appPath.split(/[\\/]/);
   const appName = pathParts[pathParts.length - 1] || 'AppProject';
 
-  const docsPath = joinPath(appPath, 'docs');
+  const docsPath = await join(appPath, 'docs');
   const hasDocsOuter = await exists(docsPath);
-
-  if (!hasDocsOuter) return { app: null, diagrams: [] };
 
   const appId = appPath;
   const app: AppItem = {
@@ -85,17 +91,18 @@ async function scanProject(appPath: string): Promise<{ app: AppItem | null; diag
 
   const diagrams: DiagramItem[] = [];
 
-  const readDiagrams = async (dirPath: string, rootType: string) => {
+  const readDiagrams = async (dirPath: string, rootType: string, depth = 0) => {
+    if (depth > 5) return; // Prevent excessive recursion
     try {
       const dirEntries = await readDir(dirPath);
       for (const dEntry of dirEntries) {
-        if (!dEntry.name || dEntry.name.startsWith('.')) continue;
+        if (!dEntry.name || dEntry.name.startsWith('.') || dEntry.name === 'node_modules' || dEntry.name === 'dist' || dEntry.name === 'build' || dEntry.name === 'out') continue;
 
-        const fullPath = joinPath(dirPath, dEntry.name);
+        const fullPath = await join(dirPath, dEntry.name);
         
         if (dEntry.isDirectory) {
-          const nextRootType = rootType === 'docs' ? dEntry.name : rootType;
-          await readDiagrams(fullPath, nextRootType);
+          const nextRootType = rootType === 'docs' ? dEntry.name : rootType === 'root' ? dEntry.name : rootType;
+          await readDiagrams(fullPath, nextRootType, depth + 1);
         } else if (dEntry.isFile && (dEntry.name.endsWith('.md') || dEntry.name.endsWith('.mmd'))) {
           try {
             const content = await readTextFile(fullPath);
@@ -122,7 +129,7 @@ async function scanProject(appPath: string): Promise<{ app: AppItem | null; diag
               filePath: fullPath,
               relativePath: fullPath.replace(appPath, '').replace(/^[\\\/]/, ''),
               projectRoot: appPath,
-              diagramRoot: joinPath(docsPath, rootType),
+              diagramRoot: await join(docsPath, rootType === 'root' ? 'general' : rootType),
               sourceFolderType: rootType === 'docs' ? 'general' : rootType,
             });
           } catch (err) {
@@ -135,10 +142,15 @@ async function scanProject(appPath: string): Promise<{ app: AppItem | null; diag
     }
   };
 
-  await readDiagrams(docsPath, 'docs');
+  // If docs exists, scan it. We also scan root if flexible reading is desired, but to avoid performance issues we focus on docs if present.
+  if (hasDocsOuter) {
+    await readDiagrams(docsPath, 'docs');
+  } else {
+    // Optionally scan root, but limit to very shallow depth to find md files
+    await readDiagrams(appPath, 'root', 0);
+  }
 
-  if (diagrams.length === 0) return { app: null, diagrams: [] };
-
+  // We return the app even if diagrams is empty, so the user can create a project successfully
   return { app, diagrams };
 }
 
@@ -155,7 +167,7 @@ export const useAppPlanStore = create<AppPlanState>((set, get) => ({
   openProjectPaths: initialOpenPaths,
   recentProjects: initialRecent,
   lastViewedDiagramIdPerApp: {},
-  workspacePath: legacyWorkspace,
+  workspacePath: null,
   previewLayout: 'horizontal',
 
   togglePreviewLayout: () => set((state) => ({
@@ -178,7 +190,7 @@ export const useAppPlanStore = create<AppPlanState>((set, get) => ({
 
     const { app, diagrams } = await scanProject(path);
     if (!app) {
-      set({ workspaceError: `No docs directory found in ${path}` });
+      set({ workspaceError: `Failed to load project from ${path}` });
       return;
     }
 
@@ -292,8 +304,8 @@ export const useAppPlanStore = create<AppPlanState>((set, get) => ({
   },
 
   createSampleWorkspace: async (parentPath: string) => {
-    const sampleDir = joinPath(parentPath, 'AppPlanSample');
-    const architectureDir = joinPath(sampleDir, 'docs', 'appplan', 'architecture');
+    const sampleDir = await join(parentPath, 'AppPlanSample');
+    const architectureDir = await join(sampleDir, 'docs', 'appplan', 'architecture');
     try {
       await mkdir(architectureDir, { recursive: true });
       const fileContent = `---
@@ -309,7 +321,7 @@ graph TD
   B --> D[Design Diagram]
 \`\`\`
 `;
-      await writeTextFile(joinPath(architectureDir, 'architecture_diagram.md'), fileContent);
+      await writeTextFile(await join(architectureDir, 'architecture_diagram.md'), fileContent);
       await get().openProject(sampleDir, true);
     } catch(err: any) {
       console.error(err);
@@ -380,8 +392,8 @@ graph TD
     
     // Find an existing root from this app, default to docs/appplan
     const existingRoot = diagrams.find(d => d.appId === appId)?.diagramRoot;
-    const saveRoot = existingRoot || joinPath(appId, 'docs', 'appplan');
-    const newFilePath = joinPath(saveRoot, fileName);
+    const saveRoot = existingRoot || await join(appId, 'docs', 'appplan');
+    const newFilePath = await join(saveRoot, fileName);
 
     const now = new Date().toISOString();
     const newDiagram = {
